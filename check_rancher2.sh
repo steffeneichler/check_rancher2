@@ -5,8 +5,8 @@
 # Official repo: https://github.com/Napsty/check_rancher2                                #
 # Documentation: https://www.claudiokuenzler.com/monitoring-plugins/check_rancher2.php   #
 # Purpose:       Monitor Rancher 2.x Kubernetes cluster and their containers             #
-# Description:   Checks status of resources within the Kubernetes cluster(s) using       #
-#                Rancher 2.x API                                                         #
+# Description:   Checks status of resources within the Rancher managed Kubernetes        #
+#                cluster(s) using Rancher 2.x API                                        #
 #                                                                                        #
 # License :      GNU General Public Licence (GPL) http://www.gnu.org/                    #
 # This program is free software; you can redistribute it and/or modify it under the      #
@@ -18,9 +18,9 @@
 # You should have received a copy of the GNU General Public License along with this      #
 # program; if not, see <https://www.gnu.org/licenses/>.                                  #
 #                                                                                        #
-# Copyright 2018-2022 Claudio Kuenzler                                                   #
+# Copyright 2018-2023,2025 Claudio Kuenzler                                              #
 # Copyright 2020 Matthias Kneer                                                          #
-# Copyright 2021,2022 Steffen Eichler                                                    #
+# Copyright 2021-2023, 2026 Steffen Eichler                                              #
 # Copyright 2021 lopf                                                                    #
 #                                                                                        #
 # History:                                                                               #
@@ -51,15 +51,20 @@
 # 20220729 1.9.0 Output improvements (#32), show workload namespace (#33)                #
 # 20220909 1.10.0 Fix ComponentStatus (#35), show K8s version in single cluster check    #
 # 20220909 1.10.0 Allow ignoring statuses on workload checks (#29)                       #
+# 20230110 1.11.0 Allow ignoring workload names, provisioning cluster not critical (#39) #
+# 20230202 1.12.0 Add local-certs check type                                             #
+# 20231208 1.12.1 Use 'command -v' instead of 'which' for required command check         #
+# 20250613 1.13.0 Add api-token check type, output fix in local-certs check, fix --help  #
 ##########################################################################################
+
 # (Pre-)Define some fixed variables
 STATE_OK=0              # define the exit code if status is OK
 STATE_WARNING=1         # define the exit code if status is Warning
 STATE_CRITICAL=2        # define the exit code if status is Critical
 STATE_UNKNOWN=3         # define the exit code if status is Unknown
 export PATH=/usr/local/bin:/usr/bin:/bin:$PATH # Set path
-proto=http		# Protocol to use, default is http, can be overwritten with -S parameter
-version=1.10.0
+proto=http              # Protocol to use, default is http, can be overwritten with -S parameter
+version=1.13.0
 ##########################################################################################
 # functions
 
@@ -149,8 +154,8 @@ function convertPods()
 # We all need help from time to time
 usage ()
 {
-printf "check_rancher2 v ${version} (c) 2018-2022 Claudio Kuenzler and contributers (published under GPLv2)
-Usage: $0 -H Rancher2Address -U user-token -P password [-S] -t checktype [-c cluster] [-p project] [-w workload]
+printf "check_rancher2 v ${version} (c) 2018-2025 Claudio Kuenzler and contributers (published under GPLv2)
+Usage: $0 -H Rancher2Address -U user-token -P password [-S] -t checktype [-c cluster] [-p project] [-n namespace] [-w workload] [-o pod]
 
 Options:
 \t[ -H | --apihost ] Address of Rancher 2 API (e.g. rancher.example.com)
@@ -164,13 +169,15 @@ Options:
 \t[ -n | --namespacename ] Namespace name (needed for specific workload or pod checks)
 \t[ -w | --workloadname ] Workload name (for specific workload check)
 \t[ -o | --podname ] Pod name (for specific pod check, this makes only sense if you use static pods)
-\t[ -i | --ignore ] Comma-separated list of status(es) to ignore (currently only supported in node check type)
-\t[ --cpu-warn ] Exit with WARNING status if more than PERCENT of cpu capacity is used (currently only supported in cluster specific node and cluster check type)
-\t[ --cpu-crit ] Exit with CRITICAL status if more than PERCENT of cpu capacity is used (currently only supported in cluster specific node and cluster check type)
-\t[ --memory-warn ] Exit with WARNING status if more than PERCENT of mem capacity is used (currently only supported in cluster specific node and cluster check type)
-\t[ --memory-crit ] Exit with CRITICAL status if more than PERCENT of mem capacity is used (currently only supported in cluster specific node and cluster check type)
-\t[ --pods-warn ] Exit with WARNING status if more than PERCENT of pod capacity is used (currently only supported in cluster specific node and cluster check type)
-\t[ --pods-crit ] Exit with CRITICAL status if more than PERCENT of pod capacity is used (currently only supported in cluster specific node and cluster check type)
+\t[ -i | --ignore ] Comma-separated list of status(es) to ignore (node and workload check types), list of workload name(s) to ignore (workload check type) or certificate to ignore (local-certs check type)
+\t[ --cpu-warn ] Exit with WARNING status if more than PERCENT of cpu capacity is used (supported check types: node, cluster)
+\t[ --cpu-crit ] Exit with CRITICAL status if more than PERCENT of cpu capacity is used (supported check types: node, cluster)
+\t[ --memory-warn ] Exit with WARNING status if more than PERCENT of mem capacity is used (supported check types: node, cluster)
+\t[ --memory-crit ] Exit with CRITICAL status if more than PERCENT of mem capacity is used (supported check types: node, cluster)
+\t[ --pods-warn ] Exit with WARNING status if more than PERCENT of pod capacity is used (supported check types: node, cluster)
+\t[ --pods-crit ] Exit with CRITICAL status if more than PERCENT of pod capacity is used (supported check types: node, cluster)
+\t[ --cert-warn ] DEPRECATED, use --expiry-warn
+\t[ --expiry-warn ] Warning threshold in days to warn before a local certificate or API token expires (supported check types: local-certs, api-token)
 \t[ -h  | --help ] Help. I need somebody. Help. Not just anybody. Heeeeeelp!
 
 Check Types:
@@ -180,13 +187,16 @@ Check Types:
 \tproject -> Checks the current status of all projects or of a specific project (defined with -p projectid)
 \tworkload -> Checks the current status of all or a specific (-w workloadname) workload within a project (-p projectid must be set!)
 \tpod -> Checks the current status of all or a specific (-o podname -n namespace) pod within a project (-p projectid must be set!)
+\tlocal-certs -> Checks the current status of all internal Rancher certificates (e.g. rancher-webhook) in local cluster under the System project (namespace: cattle-system)
+\tapi-token -> Checks the expiry of the API token used for this plugin
+\tcron -> Checks the current status of a single (-w workloadname) cronjob within a project (-p projectid and -w workloadname must be set!)
 "
 exit ${STATE_UNKNOWN}
 }
 #########################################################################
 # Check for necessary commands
 for cmd in jq curl; do
- if ! `which ${cmd} 1>/dev/null`; then
+ if ! `command -v ${cmd} 1>/dev/null`; then
    echo "UNKNOWN: ${cmd} does not exist, please check if command exists and PATH is correct"
    exit ${STATE_UNKNOWN}
  fi
@@ -220,6 +230,8 @@ while :; do
   --memory-crit)        memory_crit=${2}   ; shift 2 ;;
   --pods-warn)          pods_warn=${2}     ; shift 2 ;;
   --pods-crit)          pods_crit=${2}     ; shift 2 ;;
+  --cert-warn)          expiry_warn=${2}   ; shift 2 ;;
+  --expiry-warn)        expiry_warn=${2}   ; shift 2 ;;
   --)                   shift; break ;;
   -h | --help)          usage;;
   *)      echo "Unexpected option: $1 - this should not happen. Please consult --help for valid options."
@@ -343,7 +355,10 @@ if [[ -z $clustername ]]; then
     declare -a component=( $(echo "$api_out_clusters" | jq -r '.data[] | select(.id == "'${cluster}'") | .componentStatuses[]?.name') )
     declare -a healthstatus=( $(echo "$api_out_clusters" | jq -r '.data[] | select(.id == "'${cluster}'") | .componentStatuses[]?.conditions[].status') )
 
-    if [[ "${clusterstate}" != "active" && "${clusterstate}" != "provisioning" ]]; then
+    if [[ "${clusterstate}" = "provisioning" ]]; then
+        componentwarnings[$e]="cluster ${clusteralias} is in ${clusterstate} state -"
+        clusterwarnings[$e]="${cluster}"
+    elif [[ "${clusterstate}" != "active" ]]; then
         componenterrors[$e]="cluster ${clusteralias} is in ${clusterstate} state -"
         clustererrors[$e]="${cluster}"
     fi
@@ -361,12 +376,16 @@ if [[ -z $clustername ]]; then
   done
 
   clustererrorcount=$(echo ${clustererrors[*]} | tr ' ' '\n' | sort -u | tr '\n' ' ' | wc -w)
+  clusterwarningcount=$(echo ${clusterwarnings[*]} | tr ' ' '\n' | sort -u | tr '\n' ' ' | wc -w)
 
   if [[ ${#componenterrors[*]} -gt 0 ]]; then
-    echo "CHECK_RANCHER2 CRITICAL - ${componenterrors[*]}|'clusters_total'=${#cluster_ids[*]};;;; 'clusters_errors'=${clustererrorcount};;;;"
+    echo "CHECK_RANCHER2 CRITICAL - ${componenterrors[*]}|'clusters_total'=${#cluster_ids[*]};;;; 'clusters_errors'=${clustererrorcount};;;; 'clusters_warning'=${clusterwarningcount};;;;"
     exit ${STATE_CRITICAL}
+  elif [[ ${#componentwarnings[*]} -gt 0 ]]; then
+    echo "CHECK_RANCHER2 WARNING - ${componentwarnings[*]}|'clusters_total'=${#cluster_ids[*]};;;; 'clusters_errors'=${clustererrorcount};;;; 'clusters_warning'=${clusterwarningcount};;;;"
+    exit ${STATE_WARNING}
   else
-    echo "CHECK_RANCHER2 OK - All clusters (${#cluster_ids[*]}) are healthy|'clusters_total'=${#cluster_ids[*]};;;; 'clusters_errors'=${#componenterrors[*]};;;;"
+    echo "CHECK_RANCHER2 OK - All clusters (${#cluster_ids[*]}) are healthy|'clusters_total'=${#cluster_ids[*]};;;; 'clusters_errors'=${#componenterrors[*]};;;; 'clusters_warning'=${clusterwarningcount};;;;"
     exit ${STATE_OK}
   fi
 
@@ -973,7 +992,7 @@ fi
 if [[ -z $workloadname ]]; then
 
 # Check status of all workloads within a project (project must be given)
-  api_out_workloads=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${projectname}/workloads")
+  api_out_workloads=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${clustername}:${projectname}/workloads")
 
   if [[ -n $(echo "$api_out_workloads" | grep -i "ClusterUnavailable") ]]; then
     clustername=$(echo ${projectname} | awk -F':' '{print $1}')
@@ -994,6 +1013,10 @@ if [[ -z $workloadname ]]; then
   i=0
   for workload in ${workload_names[*]}; do
     for status in ${healthstatus[$i]}; do
+      if [[ "${ignore}" =~ "${workload}" ]]; then
+        workloadignored[$i]="Workload ${workload} is ignored -"
+        continue
+      fi
       if [[ ${status} = updating ]]; then
         if [[ -n $(echo ${ignore} | grep -i ${status}) ]]; then
           workloadignored[$i]="Workload ${workload} is ${status} but ignored -"
@@ -1168,6 +1191,158 @@ else
     exit ${STATE_OK}
   fi
 
+fi
+;;
+
+# --- local-certs --- #
+local-certs)
+rightnow=$(date +%s)
+if [[ ${expiry_warn} -gt 0 ]]; then let warning=(${rightnow}+${expiry_warn}*86400); fi
+projectid=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/cluster/local/projects" | jq -r '.data[] | select(.name == "System").id')
+
+api_out_certs=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/projects/${projectid}/namespacedcertificates?namespaceId=cattle-system")
+declare -a cert_names=( $(echo "$api_out_certs" | jq -r '.data[] | select(.type == "namespacedCertificate").name') )
+declare -a cert_expiry=( $(echo "$api_out_certs" | jq -r '.data[] | select(.type == "namespacedCertificate").expiresAt') )
+
+#echo ${cert_names[*]}     # Enable for debugging
+#echo ${cert_expiry[*]}    # Enable for debugging
+
+i=0
+for entry in ${cert_expiry[*]}; do
+  if [[ -n $(echo ${ignore} | grep -x ${cert_names[${i}]}) ]]; then
+    cert_ignored[${i}]="${cert_names[${i}]}"
+    continue
+  fi
+  expiry=$(date --date="${entry}" +%s)
+  if [[ ${rightnow} -gt ${expiry} ]]; then
+    let diff=(${rightnow}-${expiry})/86400
+    cert_expired[${i}]="${cert_names[${i}]} expired ${diff} days ago -"
+  elif [[ ${warning} -gt ${expiry} ]]; then
+    let diff=(${warning}-${expiry})/86400
+    #echo "${cert_names[${i}]} will expire in ${diff} days -"	# Enable for debugging
+    cert_warning[${i}]="${cert_names[${i}]} will expire in ${diff} days -"
+  fi
+  let i++
+done
+
+if [[ ${#cert_ignored[*]} -gt 0 ]]; then
+  ignoreoutput="- ${#cert_ignored[*]} certificate(s) ignored: ${cert_ignored[*]}"
+fi
+
+if [[ ${#cert_expired[*]} -gt 0 ]]; then
+  echo "CHECK_RANCHER2 CRITICAL - ${#cert_expired[*]} certificate(s) expired (${cert_expired[*]}) ${ignoreoutput}|'total_certs'=${#cert_names[*]};;;; 'expired_certs'=${#cert_expired[*]};;;; 'warning_certs'=${#cert_warning[*]};;;; 'ignored_certs'=${#cert_ignored[*]};;;;"
+  exit ${STATE_CRITICAL}
+elif [[ ${#cert_warning[*]} -gt 0 ]]; then
+  echo "CHECK_RANCHER2 WANRING - ${#cert_warning[*]} certificate(s) will expire soon (${cert_warning[*]}) ${ignoreoutput}|'total_certs'=${#cert_names[*]};;;; 'expired_certs'=${#cert_expired[*]};;;; 'warning_certs'=${#cert_warning[*]};;;; 'ignored_certs'=${#cert_ignored[*]};;;;"
+  exit ${STATE_WARNING}
+else
+  echo "CHECK_RANCHER2 OK - All ${#cert_names[*]} certificates are valid ${ignoreoutput}|'total_certs'=${#cert_names[*]};;;; 'expired_certs'=${#cert_expired[*]};;;; 'warning_certs'=${#cert_warning[*]};;;; 'ignored_certs'=${#cert_ignored[*]};;;;"
+  exit ${STATE_OK}
+fi
+
+;;
+
+# --- api-token --- #
+api-token)
+rightnow=$(date +%s)
+if [[ ${expiry_warn} -gt 0 ]]; then let warning=(${rightnow}+${expiry_warn}*86400); fi
+api_out_token=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/tokens/${apiuser}")
+description=$(echo "$api_out_token" | jq -r '.description')
+expired=$(echo "$api_out_token" | jq -r '.expired')
+expiredate=$(echo "$api_out_token" | jq -r '.expiresAt')
+
+if [[ -n ${description} ]]; then token_description="(${description}) "; fi
+
+# Check for expired token (usually this should never show up b/c access to Rancher API is already revoked)
+if [[ ${expired} == true ]]; then
+  echo "CHECK_RANCHER2 CRITICAL - API Token for Rancher monitoring has expired"
+  exit ${STATE_CRITICAL}
+fi
+
+if [[ -n ${expiredate} && ${expiredate} != "" ]]; then
+  # Check expiry
+  token_expiry=$(date --date="${expiredate}" +%s)
+  let diff=(${token_expiry}-${rightnow})/86400
+  if [[ ${warning} -gt ${token_expiry} ]]; then
+    echo "CHECK_RANCHER2 WARNING - API Token ${token_description}will expire in ${diff} days"
+    exit ${STATE_WARNING}
+  else
+    echo "CHECK_RANCHER2 OK - API Token ${token_description}still valid (will expire in ${diff} days)"
+    exit ${STATE_OK}
+  fi
+else
+  echo "CHECK_RANCHER2 OK - API Token ${token_description}does not expire"
+  exit ${STATE_OK}
+fi
+;;
+
+# --- cronjob status check (requires project, namespace and workload name)--- #
+
+cron)
+if [ -z $projectname ] || [ -z $workloadname ] || [ -z $namespacename ]; then
+  echo -e "CHECK_RANCHER2 UNKNOWN - To check a cronjob you must define the project (-p), workloadname (-w) and the namespace (-n)."
+  exit ${STATE_UNKNOWN}
+fi
+
+if [[ -n $namespacename && $namespacename != "" ]]; then
+  nsappend="&namespaceId=$namespacename"
+  nsoutputappend="in namespace $namespacename "
+fi
+
+api_out_single_cronjob=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${projectname}/workloads/cronjob:${namespacename}:${workloadname}")
+
+# Check if cluster is available
+if [[ -n $(echo "$api_out_single_cronjob" | grep -i "ClusterUnavailable") ]]; then
+  clustername=$(echo ${projectname} | awk -F':' '{print $1}')
+  echo "CHECK_RANCHER2 CRITICAL - Cluster $clustername not found. Hint: Use '-t info' to identify cluster and project names."; exit ${STATE_CRITICAL}
+fi
+
+# Check if that given project name exists
+if [[ -z $(echo "$api_out_single_cronjob" | grep -i "containers") ]]; then
+  echo "CHECK_RANCHER2 CRITICAL - Cronjob $workloadname ${nsoutputappend}not found."; exit ${STATE_CRITICAL}
+fi
+
+# Path to cron schedule converter
+cronconverter=/usr/lib/nagios/plugins/convert_cron_schedule.py
+
+# Check healthstatus of cronjob
+healthstatus=$(echo "$api_out_single_cronjob" | jq -r '.state')
+suspended=$(echo "$api_out_single_cronjob" | jq -r '.cronJobConfig.suspend')
+
+# Check if cronjob is active and runs in defined schedule
+if test -f "$cronconverter"; then
+
+  if [[ ${healthstatus} = active ]]; then
+    cronschedule=$(echo "$api_out_single_cronjob" | jq -r '.cronJobConfig.schedule')
+    crondiff=$(python3 $cronconverter "$cronschedule" difftimestamp)
+    currenttime=$(date +%s%N | cut -b1-13)
+    lastruntime=$(echo "$api_out_single_cronjob" | jq -r '.cronJobStatus.lastScheduleTimeTS')
+    currentdiff=$((currenttime-lastruntime))
+
+    if [[ ${suspended} = true ]]; then
+      echo "CHECK_RANCHER2 WARNING - Cronjob $workloadname ${nsoutputappend}is suspended.|'workload_active'=0;;;; 'workload_error'=0;;;; 'workload_warning'=1;;;;"
+      exit ${STATE_WARNING}
+
+    elif [[ $currentdiff -gt $crondiff ]]; then
+      echo "CHECK_RANCHER2 CRITICAL - Cronjob $workloadname ${nsoutputappend}is not running in schedule time."
+      exit ${STATE_CRITICAL}
+    else
+      echo "CHECK_RANCHER2 OK - Cronjob $workloadname ${nsoutputappend}is running properly."
+      exit ${STATE_OK}
+    fi
+
+  elif [[ ${healthstatus} = updating ]]; then
+    echo "CHECK_RANCHER2 WARNING - Cronjob $workloadname ${nsoutputappend}is ${healthstatus}|'workload_active'=0;;;; 'workload_error'=0;;;; 'workload_warning'=1;;;;"
+    exit ${STATE_WARNING}
+
+  else
+    echo "CHECK_RANCHER2 CRITICAL - Cronjob $workloadname ${nsoutputappend}is ${healthstatus}|'workload_active'=0;;;; 'workload_error'=1;;;; 'workload_warning'=0;;;;"
+    exit ${STATE_CRITICAL}
+  fi
+
+else
+  echo "CHECK_RANCHER2 UNKNOWN - Resource not found: convert_cron_schedule.py"
+  exit ${STATE_UNKNOWN}
 fi
 ;;
 
