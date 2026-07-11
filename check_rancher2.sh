@@ -151,6 +151,77 @@ function convertPods()
   printf $pods
 }
 
+# Extract numeric value and unit from Kubernetes quantity string
+# Usage: extract_value_and_unit "100m" -> outputs "100" and "m"
+function extract_value_and_unit()
+{
+  local quantity=$1
+  local value=$(echo "${quantity}" | sed 's/[a-zA-Z]*$//g')
+  local unit=$(echo "${quantity}" | sed 's/^[0-9]*//g')
+  printf "${value}|${unit}"
+}
+
+# Centralized API call function
+# Usage: api_call "/v3/clusters" or api_call_raw "/v3/project" "-o /dev/null -w '%{http_code}'"
+function api_call()
+{
+  local endpoint=$1
+  curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}${endpoint}"
+}
+
+function api_call_raw()
+{
+  local endpoint=$1
+  local curl_opts=$2
+  eval "curl -s ${selfsigned} -u \"${apiuser}:${apipass}\" ${curl_opts} \"${proto}://${apihost}${endpoint}\""
+}
+
+# Validate and normalize threshold parameters
+function validate_thresholds()
+{
+  # Set default values if empty
+  cpu_warn=${cpu_warn:-0}
+  cpu_crit=${cpu_crit:-0}
+  memory_warn=${memory_warn:-0}
+  memory_crit=${memory_crit:-0}
+  pods_warn=${pods_warn:-0}
+  pods_crit=${pods_crit:-0}
+  expiry_warn=${expiry_warn:-0}
+
+  # Check threshold ordering
+  if [[ "$cpu_warn" -gt 0 && "$cpu_crit" -gt 0 ]] && [[ "$cpu_warn" -gt "$cpu_crit" ]]; then
+    echo -e "CHECK_RANCHER2 UNKNOWN - cpu-warn should be lower than cpu-crit"
+    exit ${STATE_UNKNOWN}
+  fi
+
+  if [[ "$memory_warn" -gt 0 && "$memory_crit" -gt 0 ]] && [[ "$memory_warn" -gt "$memory_crit" ]]; then
+    echo -e "CHECK_RANCHER2 UNKNOWN - memory-warn should be lower than memory-crit"
+    exit ${STATE_UNKNOWN}
+  fi
+
+  if [[ "$pods_warn" -gt 0 && "$pods_crit" -gt 0 ]] && [[ "$pods_warn" -gt "$pods_crit" ]]; then
+    echo -e "CHECK_RANCHER2 UNKNOWN - pods-warn should be lower than pods-crit"
+    exit ${STATE_UNKNOWN}
+  fi
+}
+
+# Convert quantity string (e.g., "100m") to standardized format
+# Usage: convert_quantity "256Mi" "Memory" -> outputs converted byte value
+function convert_quantity()
+{
+  local quantity=$1
+  local type=$2
+  local value=$(echo "${quantity}" | sed 's/[a-zA-Z]*$//g')
+  local unit=$(echo "${quantity}" | sed 's/^[0-9]*//g')
+  
+  case "$type" in
+    cpu) convertCpu "$value" "$unit" ;;
+    memory) convertMemory "$value" "$unit" ;;
+    pods) convertPods "$value" "$unit" ;;
+    *) echo "UNKNOWN: unexpected quantity type (${type})." && exit ${STATE_UNKNOWN} ;;
+  esac
+}
+
 # We all need help from time to time
 usage ()
 {
@@ -260,24 +331,12 @@ if [ -z $type ]; then
   exit ${STATE_UNKNOWN}
 fi
 
-if [[ "$cpu_warn" -gt "$cpu_crit" ]]; then
-  echo -e "CHECK_RANCHER2 UNKNOWN - cpu-warn should be lower than cpu-crit"
-  exit ${STATE_UNKNOWN}
-fi
-
-if [[ "$memory_warn" -gt "$memory_crit" ]]; then
-  echo -e "CHECK_RANCHER2 UNKNOWN - memory-warn should be lower than memory-crit"
-  exit ${STATE_UNKNOWN}
-fi
-
-if [[ "$pods_warn" -gt "$pods_crit" ]]; then
-  echo -e "CHECK_RANCHER2 UNKNOWN - pods-warn should be lower than pods-crit"
-  exit ${STATE_UNKNOWN}
-fi
+# Validate and normalize thresholds
+validate_thresholds
 
 #########################################################################
 # Base communication check
-apicheck=$(curl -s ${selfsigned} -o /dev/null -w "%{http_code}" -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project")
+apicheck=$(api_call_raw "/v3/project" "-o /dev/null -w '%{http_code}'")
 
 # Detect failures
 if [[ $apicheck = 000 ]]; then
@@ -309,8 +368,8 @@ case ${type} in
 
 # --- info --- #
 info)
-api_out_clusters=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/clusters")
-api_out_project=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project")
+api_out_clusters=$(api_call "/v3/clusters")
+api_out_project=$(api_call "/v3/project")
 declare -a cluster_ids=( $(echo "$api_out_clusters" | jq -r '.data[].id') )
 declare -a cluster_names=( $(echo "$api_out_clusters" | jq -r '.data[].name') )
 declare -a project_ids=( $(echo "$api_out_project" | jq -r '.data[].id') )
@@ -324,15 +383,14 @@ declare -a project_names=( $(echo "$api_out_project" | jq -r '.data[].name') )
 i=0
 for entry in ${cluster_ids[*]}; do
   pretty_clusters[$i]="${entry} alias ${cluster_names[$i]} -"
-  let i++
+  ((i++))
 done
 
 i=0
 for entry in ${project_ids[*]}; do
   pretty_projects[$i]="${entry} alias ${project_names[$i]} -"
-  let i++
+  ((i++))
 done
-
 
 echo "CHECK_RANCHER2 OK - Found ${#cluster_ids[*]} clusters: ${pretty_clusters[*]} and ${#project_ids[*]} projects: ${pretty_projects[*]}|'clusters'=${#cluster_ids[*]};;;; 'projects'=${#project_ids[*]};;;;"
 exit ${STATE_OK} 
@@ -343,7 +401,7 @@ cluster)
 if [[ -z $clustername ]]; then
 
 # Check status of all clusters
-  api_out_clusters=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/clusters")
+  api_out_clusters=$(api_call "/v3/clusters")
   declare -a cluster_ids=( $(echo "$api_out_clusters" | jq -r '.data[].id') )
   declare -a cluster_names=( $(echo "$api_out_clusters" | jq -r '.data[].name') )
   
@@ -392,7 +450,7 @@ if [[ -z $clustername ]]; then
 else
  
 # Check status of a single cluster 
-  api_out_single_cluster=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/clusters/${clustername}")
+  api_out_single_cluster=$(api_call "/v3/clusters/${clustername}")
 
   # Check if that given cluster name exists
   if [[ -n $(echo "$api_out_single_cluster" | grep -i "NotFound") ]]; then
@@ -475,28 +533,28 @@ else
 
   # threshold checks
   # cpu
-  if [ ! -z $cpu_warn ] || [ ! -z $cpu_crit ]; then
-    if [[ "$usage_cpu" -gt "$cpu_crit" ]]; then
+  if [[ $cpu_warn -gt 0 ]] || [[ $cpu_crit -gt 0 ]]; then
+    if [[ $cpu_crit -gt 0 && "$usage_cpu" -gt "$cpu_crit" ]]; then
       resourceerrors+="CPU usage ${usage_cpu}% > threshold of ${cpu_crit}% "
-    elif [[ "$usage_cpu" -gt "$cpu_warn" ]]; then
+    elif [[ $cpu_warn -gt 0 && "$usage_cpu" -gt "$cpu_warn" ]]; then
       resourceerrors+="CPU usage ${usage_cpu}% > threshold of ${cpu_warn}% "
     fi
   fi
 
   # memory
-  if [ ! -z $memory_warn ] || [ ! -z $memory_crit ]; then
-    if [[ "$usage_memory" -gt "$memory_crit" ]]; then
+  if [[ $memory_warn -gt 0 ]] || [[ $memory_crit -gt 0 ]]; then
+    if [[ $memory_crit -gt 0 && "$usage_memory" -gt "$memory_crit" ]]; then
       resourceerrors+="MEMORY usage ${usage_memory}% > threshold of ${memory_crit}% "
-    elif [[ "$usage_memory" -gt "$memory_warn" ]]; then
+    elif [[ $memory_warn -gt 0 && "$usage_memory" -gt "$memory_warn" ]]; then
       resourceerrors+="MEMORY usage ${usage_memory}% > threshold of ${memory_warn}% "
     fi
   fi
 
   # pods
-  if [ ! -z $pods_warn ] || [ ! -z $pods_crit ]; then
-    if [[ "$usage_pods" -gt "$pods_crit" ]]; then
+  if [[ $pods_warn -gt 0 ]] || [[ $pods_crit -gt 0 ]]; then
+    if [[ $pods_crit -gt 0 && "$usage_pods" -gt "$pods_crit" ]]; then
       resourceerrors+="PODS Usage ${usage_pods} > threshold of ${pods_crit} "
-    elif [[ "$usage_pods" -gt "$pods_warn" ]]; then
+    elif [[ $pods_warn -gt 0 && "$usage_pods" -gt "$pods_warn" ]]; then
       resourceerrors+="PODS Usage ${usage_pods} > threshold of ${pods_warn} "
     fi
   fi
@@ -525,7 +583,7 @@ node)
 if [[ -z $clustername ]]; then
 
 # Check status of all nodes in all clusters
-  api_out_nodes=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/nodes")
+  api_out_nodes=$(api_call "/v3/nodes")
   declare -a node_names=( $(echo "$api_out_nodes" | jq -r '.data[].nodeName') )
   declare -a node_status=( $(echo "$api_out_nodes" | jq -r '.data[].state') )
   declare -a node_cluster_member=( $(echo "$api_out_nodes" | jq -r '.data[].clusterId') )
@@ -679,7 +737,7 @@ if [[ -z $clustername ]]; then
 else
 
 # Check status of all nodes in a specific cluster
-  api_out_nodes=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/nodes/?clusterId=${clustername}")
+  api_out_nodes=$(api_call "/v3/nodes/?clusterId=${clustername}")
   declare -a node_diskpressure=( $(echo "$api_out_nodes" | jq -r '.data[].conditions[] | select(.type=="DiskPressure").status' | awk '/True/ {print FNR}' ) )
   declare -a node_memorypressure=( $(echo "$api_out_nodes" | jq -r '.data[].conditions[] | select(.type=="MemoryPressure").status' | awk '/True/ {print FNR}' ) )
   declare -a node_kubeletready=( $(echo "$api_out_nodes" | jq -r '.data[].conditions[] | select(.type=="Ready").status' | awk '/False/ {print FNR}' ) )
@@ -772,28 +830,28 @@ else
 
   # threshold checks
   # cpu
-  if [ ! -z $cpu_warn ] || [ ! -z $cpu_crit ]; then
-    if [[ "$usage_cpu" -gt "$cpu_crit" ]]; then
+  if [[ $cpu_warn -gt 0 ]] || [[ $cpu_crit -gt 0 ]]; then
+    if [[ $cpu_crit -gt 0 && "$usage_cpu" -gt "$cpu_crit" ]]; then
       resourceerrors+="${node} - CPU usage ${usage_cpu} higher than crit threshold of ${cpu_crit} \n"
-    elif [[ "$usage_cpu" -gt "$cpu_warn" ]]; then
+    elif [[ $cpu_warn -gt 0 && "$usage_cpu" -gt "$cpu_warn" ]]; then
       resourceerrors+="${node} - CPU usage ${usage_cpu} higher than warn threshold of ${cpu_warn} \n"
     fi
   fi
 
   # memory
-  if [ ! -z $memory_warn ] || [ ! -z $memory_crit ]; then
-    if [[ "$usage_memory" -gt "$memory_crit" ]]; then
+  if [[ $memory_warn -gt 0 ]] || [[ $memory_crit -gt 0 ]]; then
+    if [[ $memory_crit -gt 0 && "$usage_memory" -gt "$memory_crit" ]]; then
       resourceerrors+="${node} - MEMORY usage ${usage_memory} higher than crit threshold of ${memory_crit} \n"
-    elif [[ "$usage_memory" -gt "$memory_warn" ]]; then
+    elif [[ $memory_warn -gt 0 && "$usage_memory" -gt "$memory_warn" ]]; then
       resourceerrors+="${node} - MEMORY usage ${usage_memory} higher than warn threshold of ${memory_warn} \n"
     fi
   fi
 
   # pods
-  if [ ! -z $pods_warn ] || [ ! -z $pods_crit ]; then
-    if [[ "$usage_pods" -gt "$pods_crit" ]]; then
+  if [[ $pods_warn -gt 0 ]] || [[ $pods_crit -gt 0 ]]; then
+    if [[ $pods_crit -gt 0 && "$usage_pods" -gt "$pods_crit" ]]; then
       resourceerrors+="${node} - PODS Usage ${usage_pods} higher than crit threshold of ${pods_crit} \n"
-    elif [[ "$usage_pods" -gt "$pods_warn" ]]; then
+    elif [[ $pods_warn -gt 0 && "$usage_pods" -gt "$pods_warn" ]]; then
       resourceerrors+="${node} - PODS Usage ${usage_pods} higher than warn threshold of ${pods_warn} \n"
     fi
   fi
@@ -932,18 +990,18 @@ project)
 if [[ -z $projectname ]]; then
 
 # Check status of all projects
-  api_out_project=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project")
+  api_out_project=$(api_call "/v3/project")
   declare -a project_ids=( $(echo "$api_out_project" | jq -r '.data[].id') )
   declare -a project_names=( $(echo "$api_out_project" | jq -r '.data[].name') )
   declare -a cluster_ids=( $(echo "$api_out_project" | jq -r '.data[].clusterId') )
   declare -a healthstatus=( $(echo "$api_out_project" | jq -r '.data[].state') )
   
-  i=0
+  let i=0
   for project in ${project_ids[*]}; do
     if [[ ${healthstatus[$i]} != "active" ]]; then
       projecterrors[$i]="${project} in cluster ${cluster_ids[$i]} is not healthy (state = ${healthstatus[$i]})"
     fi
-    let i++
+    ((i++))
   done
 
   if [[ ${#projecterrors[*]} -gt 0 ]]; then
@@ -957,7 +1015,7 @@ if [[ -z $projectname ]]; then
 else
  
 # Check status of a single project
-  api_out_single_project=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${projectname}")
+  api_out_single_project=$(api_call "/v3/project/${projectname}")
 
   # Check if that given project name exists
   if [[ -n $(echo "$api_out_single_project" | grep -i "NotFound") ]]; then
@@ -992,7 +1050,7 @@ fi
 if [[ -z $workloadname ]]; then
 
 # Check status of all workloads within a project (project must be given)
-  api_out_workloads=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${clustername}:${projectname}/workloads")
+  api_out_workloads=$(api_call "/v3/project/${clustername}:${projectname}/workloads")
 
   if [[ -n $(echo "$api_out_workloads" | grep -i "ClusterUnavailable") ]]; then
     clustername=$(echo ${projectname} | awk -F':' '{print $1}')
@@ -1036,7 +1094,7 @@ if [[ -z $workloadname ]]; then
         workloadpaused[$i]="${workload} "
       fi
     done
-    let i++
+    ((i++))
   done
 
   if [[ ${#workloadignored[*]} -gt 0 ]]; then
@@ -1066,7 +1124,7 @@ else
     nsoutputappend="in namespace $namespacename "
   fi
 
-  api_out_single_workload=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${projectname}/workloads/?name=${workloadname}${nsappend}")
+  api_out_single_workload=$(api_call "/v3/project/${projectname}/workloads/?name=${workloadname}${nsappend}")
 
   if [[ -n $(echo "$api_out_single_workload" | grep -i "ClusterUnavailable") ]]; then
     clustername=$(echo ${projectname} | awk -F':' '{print $1}')
@@ -1126,7 +1184,7 @@ if [[ -z $podname ]]; then
     outputappend="and namespace $namespacename "
   fi
 
-  api_out_pods=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${projectname}/pods${nsappend}")
+  api_out_pods=$(api_call "/v3/project/${projectname}/pods${nsappend}")
 
   if [[ -n $(echo "$api_out_pods" | grep -i "ClusterUnavailable") ]]; then
     clustername=$(echo ${projectname} | awk -F':' '{print $1}')
@@ -1143,14 +1201,12 @@ if [[ -z $podname ]]; then
     exit ${STATE_WARNING}
   fi
 
-  i=0
-  for pod in ${pod_names[*]}; do
+  for i in ${!pod_names[@]}; do
     for status in ${healthstatus[$i]}; do
       if [[ ${status} != running && ${status} != succeeded ]]; then
-        poderrors[$i]="Pod ${pod} is ${status}\n"
+        poderrors[$i]="Pod ${pod_names[$i]} is ${status}\n"
       fi
     done
-    let i++
   done
 
   if [[ ${#poderrors[*]} -gt 0 ]]; then
@@ -1169,7 +1225,7 @@ else
     exit ${STATE_UNKNOWN}
   fi
   
-  api_out_single_pod=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${projectname}/pods/${namespacename}:${podname}")
+  api_out_single_pod=$(api_call "/v3/project/${projectname}/pods/${namespacename}:${podname}")
 
   if [[ -n $(echo "$api_out_single_pod" | grep -i "ClusterUnavailable") ]]; then
     clustername=$(echo ${projectname} | awk -F':' '{print $1}')
@@ -1198,9 +1254,9 @@ fi
 local-certs)
 rightnow=$(date +%s)
 if [[ ${expiry_warn} -gt 0 ]]; then let warning=(${rightnow}+${expiry_warn}*86400); fi
-projectid=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/cluster/local/projects" | jq -r '.data[] | select(.name == "System").id')
+projectid=$(api_call "/v3/cluster/local/projects" | jq -r '.data[] | select(.name == "System").id')
 
-api_out_certs=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/projects/${projectid}/namespacedcertificates?namespaceId=cattle-system")
+api_out_certs=$(api_call "/v3/projects/${projectid}/namespacedcertificates?namespaceId=cattle-system")
 declare -a cert_names=( $(echo "$api_out_certs" | jq -r '.data[] | select(.type == "namespacedCertificate").name') )
 declare -a cert_expiry=( $(echo "$api_out_certs" | jq -r '.data[] | select(.type == "namespacedCertificate").expiresAt') )
 
@@ -1233,7 +1289,7 @@ if [[ ${#cert_expired[*]} -gt 0 ]]; then
   echo "CHECK_RANCHER2 CRITICAL - ${#cert_expired[*]} certificate(s) expired (${cert_expired[*]}) ${ignoreoutput}|'total_certs'=${#cert_names[*]};;;; 'expired_certs'=${#cert_expired[*]};;;; 'warning_certs'=${#cert_warning[*]};;;; 'ignored_certs'=${#cert_ignored[*]};;;;"
   exit ${STATE_CRITICAL}
 elif [[ ${#cert_warning[*]} -gt 0 ]]; then
-  echo "CHECK_RANCHER2 WANRING - ${#cert_warning[*]} certificate(s) will expire soon (${cert_warning[*]}) ${ignoreoutput}|'total_certs'=${#cert_names[*]};;;; 'expired_certs'=${#cert_expired[*]};;;; 'warning_certs'=${#cert_warning[*]};;;; 'ignored_certs'=${#cert_ignored[*]};;;;"
+  echo "CHECK_RANCHER2 WARNING - ${#cert_warning[*]} certificate(s) will expire soon (${cert_warning[*]}) ${ignoreoutput}|'total_certs'=${#cert_names[*]};;;; 'expired_certs'=${#cert_expired[*]};;;; 'warning_certs'=${#cert_warning[*]};;;; 'ignored_certs'=${#cert_ignored[*]};;;;"
   exit ${STATE_WARNING}
 else
   echo "CHECK_RANCHER2 OK - All ${#cert_names[*]} certificates are valid ${ignoreoutput}|'total_certs'=${#cert_names[*]};;;; 'expired_certs'=${#cert_expired[*]};;;; 'warning_certs'=${#cert_warning[*]};;;; 'ignored_certs'=${#cert_ignored[*]};;;;"
@@ -1246,7 +1302,7 @@ fi
 api-token)
 rightnow=$(date +%s)
 if [[ ${expiry_warn} -gt 0 ]]; then let warning=(${rightnow}+${expiry_warn}*86400); fi
-api_out_token=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/tokens/${apiuser}")
+api_out_token=$(api_call "/v3/tokens/${apiuser}")
 description=$(echo "$api_out_token" | jq -r '.description')
 expired=$(echo "$api_out_token" | jq -r '.expired')
 expiredate=$(echo "$api_out_token" | jq -r '.expiresAt')
@@ -1289,7 +1345,7 @@ if [[ -n $namespacename && $namespacename != "" ]]; then
   nsoutputappend="in namespace $namespacename "
 fi
 
-api_out_single_cronjob=$(curl -s ${selfsigned} -u "${apiuser}:${apipass}" "${proto}://${apihost}/v3/project/${projectname}/workloads/cronjob:${namespacename}:${workloadname}")
+api_out_single_cronjob=$(api_call "/v3/project/${projectname}/workloads/cronjob:${namespacename}:${workloadname}")
 
 # Check if cluster is available
 if [[ -n $(echo "$api_out_single_cronjob" | grep -i "ClusterUnavailable") ]]; then
